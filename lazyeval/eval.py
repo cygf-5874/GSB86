@@ -36,14 +36,13 @@ _OPS = {
 }
 
 
-def _truthy(value):
-    return bool(value)
-
-
 class _Evaluator(object):
     def __init__(self, env, effects):
         self.env = env
         self.effects = effects
+        # 仅在本次 eval 调用内生效的惰性序列物化缓存，按节点对象身份区分；
+        # 每次 eval 都会新建一个求值器，因此不会留下跨调用状态。
+        self._materialized = {}
 
     # -- 调度 ------------------------------------------------------------
     def evaluate(self, node):
@@ -74,28 +73,22 @@ class _Evaluator(object):
         return self.env[node.name]
 
     def _binop(self, node):
-        try:
-            left = self.evaluate(node.left)
-            right = self.evaluate(node.right)
-            return _OPS[node.op](left, right)
-        except Exception:
-            return None
+        left = self.evaluate(node.left)
+        right = self.evaluate(node.right)
+        return _OPS[node.op](left, right)
 
     def _boolop(self, node):
         left = self.evaluate(node.left)
-        self._note_effects(node.right)
-        right = self.evaluate(node.right)
         if node.op == "and":
-            return right if _truthy(left) else left
+            return left if not left else self.evaluate(node.right)
         if node.op == "or":
-            return left if _truthy(left) else right
+            return left if left else self.evaluate(node.right)
         raise ValueError("未知逻辑运算符：%r" % (node.op,))
 
     def _ifexp(self, node):
-        cond = _truthy(self.evaluate(node.cond))
-        body = self.evaluate(node.body)
-        orelse = self.evaluate(node.orelse)
-        return body if cond else orelse
+        if self.evaluate(node.cond):
+            return self.evaluate(node.body)
+        return self.evaluate(node.orelse)
 
     def _call(self, node):
         args = [self.evaluate(arg) for arg in node.args]
@@ -107,15 +100,23 @@ class _Evaluator(object):
             value = self._apply(name, (value,))
         return value
 
-    # -- 惰性序列 --------------------------------------------------------
+    # -- 惰性序列（同一次调用内只物化一次）------------------------------
     def _range(self, node):
+        if node in self._materialized:
+            return self._materialized[node]
+        value = list(range(node.start, node.stop))
         self.effects.record("range")
-        return list(range(node.start, node.stop))
+        self._materialized[node] = value
+        return value
 
     def _map(self, node):
+        if node in self._materialized:
+            return self._materialized[node]
         self.effects.record("map")
         source = self.evaluate(node.source)
-        return [self._apply(node.name, (item,)) for item in source]
+        value = [self._apply(node.name, (item,)) for item in source]
+        self._materialized[node] = value
+        return value
 
     # -- 调用 ------------------------------------------------------------
     def _apply(self, name, args):
@@ -123,32 +124,6 @@ class _Evaluator(object):
             raise NameError("未绑定的可调用名：%r" % (name,))
         self.effects.record(name)
         return self.env[name](*args)
-
-    def _note_effects(self, node):
-        if isinstance(node, Call):
-            self.effects.record(node.name)
-        elif isinstance(node, RangeNode):
-            self.effects.record("range")
-        elif isinstance(node, MapNode):
-            self.effects.record("map")
-        for child in self._children(node):
-            self._note_effects(child)
-
-    @staticmethod
-    def _children(node):
-        if isinstance(node, BinOp):
-            return (node.left, node.right)
-        if isinstance(node, BoolOp):
-            return (node.left, node.right)
-        if isinstance(node, IfExp):
-            return (node.cond, node.body, node.orelse)
-        if isinstance(node, Call):
-            return tuple(node.args)
-        if isinstance(node, Pipe):
-            return (node.value,)
-        if isinstance(node, MapNode):
-            return (node.source,)
-        return ()
 
 
 def eval(node, env, effects):
